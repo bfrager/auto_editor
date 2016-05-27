@@ -79,10 +79,10 @@ def readEegData(eegPath):
     concentration = numpy.array([x['Concentration'] for x in rows])
     return seconds, mellow, concentration
 
-def readEmotionData(emotionPath):
+def readEmotionData(filepath, metrics):
     headers = []
     rows = []
-    with open(eegPath, 'rb') as f:
+    with open(filepath, 'rb') as f:
         reader = csv.reader(f)
 
         firstTimeStamp = None
@@ -92,16 +92,15 @@ def readEmotionData(emotionPath):
                 continue
 
             d = dict([(header, value) for header, value in zip(headers, row)])
-            d['TimeStamp'] = convertTimeStamp(d['TimeStamp'])
 
             if firstTimeStamp is None:
-                firstTimeStamp = d['TimeStamp']
+                firstTimeStamp = d['timestamp'] / 1000
                 d['Seconds'] = 0
             else:
-                d['Seconds'] = d['TimeStamp'] - firstTimeStamp
+                d['Seconds'] = d['timestamp'] / 1000 - firstTimeStamp
 
             for k in d.keys():
-                if k in ('TimeStamp', 'Seconds'):
+                if k in ('timestamp', 'Seconds'):
                     continue
                 v = d[k]
                 if v.strip() == '':
@@ -112,9 +111,12 @@ def readEmotionData(emotionPath):
             rows.append(d)
 
     seconds = numpy.array([x['Seconds'] for x in rows])
-    mellow = numpy.array([x['Mellow'] for x in rows])
-    concentration = numpy.array([x['Concentration'] for x in rows])
-    return seconds, mellow, concentration
+
+    metricsDict = dict()
+    for metric in metrics:
+        metricsDict[metric] = numpy.array([x[metric + 'ct_emotion_nonlinear_causal'] for x in rows])
+
+    return seconds, metricsDict
 
 def saveAudioCache(audioPath, cachePath):
     import librosa
@@ -131,10 +133,15 @@ def loadAudioCache(cachePath):
     with open(cachePath, 'rb') as f:
         return json.load(f)
 
-def chooseClip(targetMellow, targetConcentrate, clips, lastClip, reusedCounter):
+def chooseClip(targetMellow, targetConcentrate, targetEmotions, targetValence, clips, lastClip, reusedCounter):
     """
-    Given a value of -1 to 1 for mellow or concentrate pick a track
+    Determines ideal camera angle and shot content based on source data:
+    1) Sums all targetEmotions to compute emotional intensity of shot as deviation from neutral camera angle (MS-MWS)
+    2) Compares targetMellow vs targetConcentrate to choose which direction to select on camera angle spectrum (XCU-CU-MS-MWS-WS-XWS)
+    3) OPTION: We can implement targetValence as control over frames per second (slow motion)
+    4) TODO: Integrate Watson JSON data to incorporate lyrical emotional data
     """
+    # Control randomness factor in choosing clip for iteration (0 = no randomness, 1.0 = highly random)
     randomness = 1.0
 
     def score(target, value):
@@ -147,10 +154,9 @@ def chooseClip(targetMellow, targetConcentrate, clips, lastClip, reusedCounter):
     # Compute the score for each and then pick the highest score.
     scores = []
     for clip in clips:
-        trackScores = [
-            score(targetMellow, clip.mellow),
-            score(targetConcentrate, clip.concentrate),
-        ]
+        trackScores = []
+        for metric in metrics:
+            trackScores.append(score(metric, clip[metric])
         averageScore = numpy.mean(trackScores)
         if clip == lastClip:
             averageScore = averageScore * (1 / (math.log(reusedCounter + 1) + 1))
@@ -163,7 +169,7 @@ def chooseClip(targetMellow, targetConcentrate, clips, lastClip, reusedCounter):
     sortedByScores = sorted(scores, key=lambda x: x[1], reverse=True)
     return sortedByScores[0][0]
 
-def generateEdl(beatCachePath, clipDescriptionPath, musePath, emotionPath, outputPath):
+def generateEdl(beatCachePath, clipDescriptionPath, musePath, affdexPath, outputPath):
     beats = loadAudioCache(beatCachePath)
     if len(beats) <= 0:
         raise ValueError('There are no beats!')
@@ -183,26 +189,34 @@ def generateEdl(beatCachePath, clipDescriptionPath, musePath, emotionPath, outpu
         c.mellow = clipInfo['mellow']
         clips.append(c)
 
+    emotionMetrics = ['joy', 'disgust', 'sadness', 'anger', 'surprise', 'contempt', 'fear', 'valence']
+
+    # Read key data points
     eeg = readEegData(musePath)
-    emotion = readEmotionData(emotionPath)
+    emotions = readEmotionData(affdexPath, emotionMetrics)
     edlFile = EDL(os.path.splitext(os.path.basename(outputPath))[0])
 
-    createCuts(scenes=clipDescriptionBlob['scenes'], clips=clips, eeg=eeg, beats=beats, edl=edlFile)
+    createCuts(scenes=clipDescriptionBlob['scenes'], clips=clips, eeg=eeg, emotions=emotions, beats=beats, edl=edlFile)
 
     with open(outputPath, 'wb') as f:
         edlFile.write(f)
 
-def createCuts(scenes, clips, eeg, beats, edl):
+def createCuts(scenes, clips, eeg, emotions, beats, edl):
     """
 
     :param scenes: A list of dicts representing the allowed clips for a duration
     :param clips: a list of Clip objects
     :param eeg: a list of dicts for each eeg frame.
+    :param emotions: a list of dicts for each emotion frame.
     :param beats: a list of floating point seconds for each beat time
     :param edl: the EDL object to write cuts to.
     :return:
     """
+
     seconds, mellow, concentration = eeg
+    emotionTime, emotionData = emotions
+    emotionSampleRate = 14  # samples per second
+
     slateFrames = 20
     firstTime = 0
     lastClip = None
@@ -225,6 +239,17 @@ def createCuts(scenes, clips, eeg, beats, edl):
         # The amount of concentration for this beat section
         concentrateAvg = numpy.mean(concentrateSegment)
 
+        # The averages of each emotion in this segment
+        emotionAverages = {}
+        for emotion in emotionData:
+            emotionSegment = emotion[first*emotionSampleRate:last*emotionSampleRate + emotionSampleRate]
+            emotionAvg = numpy.mean(emotionSegment)
+            # Separate valence from dictionary to use as separate metric control
+            if emotion != 'valence':
+                emotionAverages[emotion] = emotionAvg
+            else:
+                valenceAvg = emotionAvg
+
         # What clips are we choosing from in this beat segment?
         chosenScene = None
         sceneStartT = 0
@@ -240,7 +265,7 @@ def createCuts(scenes, clips, eeg, beats, edl):
 
         skipToNextBeat = False
         while True:
-            clip = chooseClip(mellowAvg, concentrateAvg, clipSelection, lastClip, sameClipBeatCounter)
+            clip = chooseClip(mellowAvg, concentrateAvg, emotionAverages, valenceAvg, clipSelection, lastClip, sameClipBeatCounter)
             print clip, first, last
             if clip == lastClip:
                 if sameClipBeatCounter > sameClipBeatLimit:
@@ -310,11 +335,15 @@ def main():
             raise ValueError('Clip description does not exist.')
         musePath = arguments['<muse_eeg_csv>']
         if not os.path.exists(musePath):
-            raise ValueError('Muse does not exist.')
+            raise ValueError('EEG Path does not exist.')
+        affdexPath = arguments['<emotion_csv>']
+        if not os.path.exists(affdexPath):
+            raise ValueError('Emotion Path does not exist.')
         outputEdlPath = arguments['<output_edl>']
         return generateEdl(beatCachePath=beatCachePath,
                            clipDescriptionPath=clipDescriptionPath,
                            musePath=musePath,
+                           affdexPath=affdexPath,
                            outputPath=outputEdlPath)
 
     if arguments['graph']:
